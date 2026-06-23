@@ -19,9 +19,9 @@ namespace BannerlordFirewall
         private const int MaxWhitelistedPlayers = 512;
         public const int MaxPlayersPerJoinMessage = 128;
         private const int MaxWhitelistedIpsPerSubnet24 = 16;
-        private const int PendingWhitelistSeconds = 90;
+        private const int PendingWhitelistSeconds = 20;
         private const int TemporaryBlockMinutes = 60;
-        private const int MaxPendingTimeoutsBeforeBlock = 3;
+        private const int MaxPendingTimeoutsBeforeBlock = 1;
         private const int MaxFastDisconnectsBeforeBlock = 3;
         private const int MaxIpChangesBeforeBlock = 4;
         private const int FastDisconnectSeconds = 45;
