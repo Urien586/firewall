@@ -1,11 +1,5 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using TaleWorlds.Library;
 using TaleWorlds.MountAndBlade;
-using WindowsFirewallHelper;
 
 namespace BannerlordFirewall.MissionBehaviors
 {
@@ -17,23 +11,48 @@ namespace BannerlordFirewall.MissionBehaviors
             Debug.Print("[BannerlordFirewall] RemoveIpBehavior has been initialized.", 0, Debug.DebugColor.Purple);
         }
 
+        public override void OnPlayerConnectedToServer(NetworkCommunicator networkPeer)
+        {
+            base.OnPlayerConnectedToServer(networkPeer);
+            MarkPlayerInGame(networkPeer);
+        }
+
+        protected override void HandleNewClientAfterSynchronized(NetworkCommunicator networkPeer)
+        {
+            base.HandleNewClientAfterSynchronized(networkPeer);
+            MarkPlayerInGame(networkPeer);
+        }
+
         public override void OnPlayerDisconnectedFromServer(NetworkCommunicator networkPeer)
         {
-            if (BannerlordFirewall.Instance.GetFirewallRule() == null) return;
-            if (networkPeer?.PlayerConnectionInfo?.PlayerID == null) return;
-
-            // Oyuncuyu listeden güvenli şekilde siliyoruz
-            if (BannerlordFirewall.Instance.WhitelistedIps.TryRemove(networkPeer.PlayerConnectionInfo.PlayerID, out _))
+            BannerlordFirewall firewall = BannerlordFirewall.Instance;
+            if (firewall == null)
             {
-                // Giriş eventiyle çakışmaması için kilitleme yapılıyor
-                lock (BannerlordFirewall.FirewallLock)
-                {
-                    IAddress[] addresses = BannerlordFirewall.Instance.WhitelistedIps.Values.ToArray();
-                    Debug.Print("[BannerlordFirewall] " + networkPeer.UserName + " was removed from the firewall whitelist, whitelisted ip count: " + addresses.Length.ToString(), 0, Debug.DebugColor.Red);
-
-                    BannerlordFirewall.Instance.GetFirewallRule().RemoteAddresses = addresses;
-                }
+                return;
             }
+
+            if (networkPeer == null || networkPeer.PlayerConnectionInfo == null || networkPeer.PlayerConnectionInfo.PlayerID == null)
+            {
+                return;
+            }
+
+            firewall.RemoveWhitelistedPlayer(networkPeer.PlayerConnectionInfo.PlayerID, networkPeer.UserName);
+        }
+
+        private static void MarkPlayerInGame(NetworkCommunicator networkPeer)
+        {
+            BannerlordFirewall firewall = BannerlordFirewall.Instance;
+            if (firewall == null)
+            {
+                return;
+            }
+
+            if (networkPeer == null || networkPeer.PlayerConnectionInfo == null || networkPeer.PlayerConnectionInfo.PlayerID == null)
+            {
+                return;
+            }
+
+            firewall.MarkPlayerInGame(networkPeer.PlayerConnectionInfo.PlayerID, networkPeer.UserName);
         }
     }
 }
