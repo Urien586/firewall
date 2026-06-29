@@ -1,0 +1,5 @@
+# One allowed IPv4 address per line.
+# Only these source IPs can reach inbound TCP/3389.
+#
+# Example:
+# 1.2.3.4

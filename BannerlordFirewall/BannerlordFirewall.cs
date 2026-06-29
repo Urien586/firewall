@@ -2,11 +2,16 @@ using BannerlordFirewall.MissionBehaviors;
 using BannerlordFirewall.PatchedCode;
 using System;
 using System.Collections.Concurrent;
+using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
 using TaleWorlds.Library;
+using TaleWorlds.ModuleManager;
 using TaleWorlds.MountAndBlade;
 using TaleWorlds.MountAndBlade.Diamond;
 using TaleWorlds.PlayerServices;
@@ -26,8 +31,22 @@ namespace BannerlordFirewall
         private const int FastDisconnectSeconds = 45;
         private const string HarmonyId = "mentalrob.bannerlordfirewall.bannerlord";
         private const string NativeFilterDllName = "windivert_game_filter.dll";
+        private const string DdosWebhookUrl = "WEB_HOOK_GIR";
+        private const int DdosLogIntervalSeconds = 10;
+        private const int MaxDdosIpsInLiveLog = 40;
+        private const int MaxDdosIpsInDiscordLog = 90;
 
         public static BannerlordFirewall Instance;
+        private static readonly BlockedIPLogCallback NativeBlockedIPLogCallback = OnNativeBlockedIPLog;
+        private static readonly object DdosLogLock = new object();
+        private static readonly ConcurrentDictionary<string, uint> DdosBlockedIpPacketCounts = new ConcurrentDictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+        private static readonly HttpClient DdosWebhookHttpClient = new HttpClient();
+        private static DateTime _nextDdosLogAtUtc = DateTime.MinValue;
+        private static uint _ddosBlockedPacketCount;
+        private static ushort _lastDdosPort;
+        private static int _ddosLogSequence;
+        private static int _ddosShutdownHandlersRegistered;
+        private static int _ddosShutdownFlushStarted;
 
         public static readonly object FirewallLock = new object();
 
@@ -53,6 +72,22 @@ namespace BannerlordFirewall
         [DllImport(NativeFilterDllName, CallingConvention = CallingConvention.Cdecl)]
         private static extern void RemoveAllowedIP(uint ip);
 
+        [DllImport(NativeFilterDllName, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void SetProtectedUdpPort(ushort port);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void BlockedIPLogCallback(uint ip, ushort port, uint blockedPacketCount);
+
+        [DllImport(NativeFilterDllName, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void SetBlockedIPLogCallback(BlockedIPLogCallback callback);
+
+        [DllImport(NativeFilterDllName, CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.I4)]
+        private static extern int StartFilter();
+
+        [DllImport(NativeFilterDllName, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void StopFilter();
+
         public bool IsNativeFilterAvailable()
         {
             return this._nativeFilterAvailable;
@@ -69,6 +104,19 @@ namespace BannerlordFirewall
             {
                 lock (FirewallLock)
                 {
+                    int port = Module.CurrentModule.StartupInfo.ServerPort;
+                    if (port < 1 || port > 65535)
+                    {
+                        throw new InvalidOperationException("[BannerlordFirewall] Invalid server port: " + port.ToString());
+                    }
+
+                    SetProtectedUdpPort(Convert.ToUInt16(port));
+                    SetBlockedIPLogCallback(NativeBlockedIPLogCallback);
+                    if (StartFilter() == 0)
+                    {
+                        throw new InvalidOperationException("StartFilter returned failure");
+                    }
+
                     this.RefreshFirewallWhitelistLocked();
                     this._nativeFilterAvailable = true;
                     return true;
@@ -454,6 +502,269 @@ namespace BannerlordFirewall
             return BitConverter.ToUInt32(IPAddress.Parse(ipAddressText).GetAddressBytes(), 0);
         }
 
+        private static void OnNativeBlockedIPLog(uint ip, ushort port, uint blockedPacketCount)
+        {
+            try
+            {
+                string ipAddressText = new IPAddress(BitConverter.GetBytes(ip)).ToString();
+                RegisterDdosBlockedPacket(ipAddressText, port, blockedPacketCount);
+            }
+            catch (Exception exception)
+            {
+                Debug.Print("[BannerlordFirewall] WinDivert blocked packet log failed: " + SafeLogValue(exception.Message), 0, Debug.DebugColor.Red);
+            }
+        }
+
+        private static void RegisterDdosBlockedPacket(string ipAddressText, ushort port, uint blockedPacketCount)
+        {
+            DateTime now = DateTime.UtcNow;
+
+            lock (DdosLogLock)
+            {
+                if (_nextDdosLogAtUtc == DateTime.MinValue)
+                {
+                    _nextDdosLogAtUtc = now.AddSeconds(DdosLogIntervalSeconds);
+                }
+
+                _lastDdosPort = port;
+                _ddosBlockedPacketCount = AddUInt32Clamped(_ddosBlockedPacketCount, blockedPacketCount);
+                DdosBlockedIpPacketCounts.AddOrUpdate(ipAddressText, blockedPacketCount, (key, value) => AddUInt32Clamped(value, blockedPacketCount));
+
+                if (now >= _nextDdosLogAtUtc)
+                {
+                    FlushDdosLogLocked(false);
+                    _nextDdosLogAtUtc = now.AddSeconds(DdosLogIntervalSeconds);
+                }
+            }
+        }
+
+        private static void FlushDdosLogLocked(bool serverStopping)
+        {
+            if (_ddosBlockedPacketCount == 0 || DdosBlockedIpPacketCounts.Count == 0)
+            {
+                return;
+            }
+
+            int logNumber = ++_ddosLogSequence;
+            string modulePath = GetBannerlordFirewallModulePath();
+            string consoleMessage = BuildDdosConsoleLogMessage(modulePath, serverStopping, logNumber);
+            string discordMessage = BuildDdosDiscordLogMessage(modulePath, serverStopping, logNumber);
+            Debug.Print(consoleMessage, 0, Debug.DebugColor.Red);
+            SendDiscordWebhook(discordMessage);
+            WriteDdosFileLog(modulePath, logNumber, serverStopping, consoleMessage + Environment.NewLine + discordMessage);
+
+            uint ignored;
+            foreach (string key in DdosBlockedIpPacketCounts.Keys.ToArray())
+            {
+                DdosBlockedIpPacketCounts.TryRemove(key, out ignored);
+            }
+
+            _ddosBlockedPacketCount = 0;
+        }
+
+        private static string BuildDdosConsoleLogMessage(string modulePath, bool serverStopping, int logNumber)
+        {
+            var topIps = DdosBlockedIpPacketCounts
+                .OrderByDescending(pair => pair.Value)
+                .ThenBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                .Take(MaxDdosIpsInLiveLog)
+                .ToArray();
+
+            StringBuilder builder = new StringBuilder();
+            builder.Append(serverStopping ? "[BannerlordFirewall] SERVER STOP DDoS summary" : "[BannerlordFirewall] DDoS summary");
+            builder.Append(" #");
+            builder.Append(logNumber.ToString("D6"));
+            builder.Append(" | UDP ");
+            builder.Append(_lastDdosPort.ToString());
+            builder.Append(" | packets: ");
+            builder.Append(_ddosBlockedPacketCount.ToString());
+            builder.Append(" | unique IPs: ");
+            builder.Append(DdosBlockedIpPacketCounts.Count.ToString());
+            builder.Append(" | modulePath: ");
+            builder.Append(modulePath);
+
+            builder.AppendLine();
+            builder.Append("Top IPs: ");
+            for (int i = 0; i < topIps.Length; i++)
+            {
+                if (i > 0)
+                {
+                    builder.Append(", ");
+                }
+
+                builder.Append(topIps[i].Key);
+                builder.Append("=");
+                builder.Append(topIps[i].Value.ToString());
+            }
+
+            if (DdosBlockedIpPacketCounts.Count > topIps.Length)
+            {
+                builder.Append(", ... +");
+                builder.Append((DdosBlockedIpPacketCounts.Count - topIps.Length).ToString());
+                builder.Append(" more");
+            }
+
+            return TruncateForDiscord(builder.ToString());
+        }
+
+        private static string BuildDdosDiscordLogMessage(string modulePath, bool serverStopping, int logNumber)
+        {
+            var liveIps = DdosBlockedIpPacketCounts
+                .OrderByDescending(pair => pair.Value)
+                .ThenBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                .Take(MaxDdosIpsInDiscordLog)
+                .ToArray();
+
+            StringBuilder builder = new StringBuilder();
+            builder.Append(serverStopping ? "**BannerlordFirewall DDoS Final Raporu**" : "**BannerlordFirewall Canli DDoS Raporu**");
+            builder.Append(" `#");
+            builder.Append(logNumber.ToString("D6"));
+            builder.Append("`");
+            builder.AppendLine();
+            builder.Append("Port: UDP ");
+            builder.Append(_lastDdosPort.ToString());
+            builder.Append(" | Paket: ");
+            builder.Append(_ddosBlockedPacketCount.ToString());
+            builder.Append(" | IP cesidi: ");
+            builder.Append(DdosBlockedIpPacketCounts.Count.ToString());
+            builder.Append(" | Pencere: ");
+            builder.Append(DdosLogIntervalSeconds.ToString());
+            builder.Append(" sn");
+            builder.AppendLine();
+            builder.Append("ModulePath: ");
+            builder.Append(modulePath);
+            builder.AppendLine();
+            builder.AppendLine();
+            builder.AppendLine("Canli IP listesi:");
+
+            for (int i = 0; i < liveIps.Length; i++)
+            {
+                builder.Append("- ");
+                builder.Append(liveIps[i].Key);
+                builder.Append(" = ");
+                builder.Append(liveIps[i].Value.ToString());
+                builder.AppendLine(" paket");
+            }
+
+            if (DdosBlockedIpPacketCounts.Count > liveIps.Length)
+            {
+                builder.Append("... +");
+                builder.Append((DdosBlockedIpPacketCounts.Count - liveIps.Length).ToString());
+                builder.AppendLine(" IP daha");
+            }
+
+            return TruncateForDiscord(builder.ToString());
+        }
+
+        private static void SendDiscordWebhook(string message)
+        {
+            ThreadPool.QueueUserWorkItem(state =>
+            {
+                try
+                {
+                    string payload = "{\"content\":\"" + JsonEscape((string)state) + "\"}";
+                    using (StringContent content = new StringContent(payload, Encoding.UTF8, "application/json"))
+                    {
+                        DdosWebhookHttpClient.PostAsync(DdosWebhookUrl, content).Wait(5000);
+                    }
+                }
+                catch (Exception exception)
+                {
+                    Debug.Print("[BannerlordFirewall] Discord DDoS webhook failed: " + SafeLogValue(exception.Message), 0, Debug.DebugColor.Red);
+                }
+            }, message);
+        }
+
+        private static void WriteDdosFileLog(string modulePath, int logNumber, bool serverStopping, string message)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(modulePath))
+                {
+                    return;
+                }
+
+                Directory.CreateDirectory(modulePath);
+                string logLine = "================ DDoS LOG #" + logNumber.ToString("D6") + " " + DateTime.UtcNow.ToString("o") + (serverStopping ? " SERVER_STOP" : " LIVE") + " ================" + Environment.NewLine + message + Environment.NewLine;
+                File.AppendAllText(Path.Combine(modulePath, "ddos_live_ips.log"), logLine);
+            }
+            catch (Exception exception)
+            {
+                Debug.Print("[BannerlordFirewall] DDoS file log failed: " + SafeLogValue(exception.Message), 0, Debug.DebugColor.Red);
+            }
+        }
+
+        private static void RegisterDdosShutdownHandlers()
+        {
+            if (Interlocked.Exchange(ref _ddosShutdownHandlersRegistered, 1) == 1)
+            {
+                return;
+            }
+
+            AppDomain.CurrentDomain.ProcessExit += OnDdosProcessExit;
+            AppDomain.CurrentDomain.DomainUnload += OnDdosProcessExit;
+        }
+
+        private static void OnDdosProcessExit(object sender, EventArgs eventArgs)
+        {
+            if (Interlocked.Exchange(ref _ddosShutdownFlushStarted, 1) == 1)
+            {
+                return;
+            }
+
+            try
+            {
+                lock (DdosLogLock)
+                {
+                    FlushDdosLogLocked(true);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static string GetBannerlordFirewallModulePath()
+        {
+            try
+            {
+                return ModuleHelper.GetModuleFullPath("BannerlordFirewall");
+            }
+            catch (Exception exception)
+            {
+                return "ModuleHelper.GetModuleFullPath failed: " + SafeLogValue(exception.Message);
+            }
+        }
+
+        private static uint AddUInt32Clamped(uint left, uint right)
+        {
+            return uint.MaxValue - left < right ? uint.MaxValue : left + right;
+        }
+
+        private static string TruncateForDiscord(string value)
+        {
+            if (string.IsNullOrEmpty(value) || value.Length <= 1900)
+            {
+                return value;
+            }
+
+            return value.Substring(0, 1900) + "...";
+        }
+
+        private static string JsonEscape(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return string.Empty;
+            }
+
+            return value
+                .Replace("\\", "\\\\")
+                .Replace("\"", "\\\"")
+                .Replace("\r", "\\r")
+                .Replace("\n", "\\n");
+        }
+
         private static bool IsPublicUnicastIpv4(IPAddress ipAddress, out string rejectReason)
         {
             rejectReason = null;
@@ -558,6 +869,7 @@ namespace BannerlordFirewall
             this.FastDisconnectCounts = new ConcurrentDictionary<string, int>();
             this.IpChangeCounts = new ConcurrentDictionary<string, int>();
             this.LastPlayerIpAddress = new ConcurrentDictionary<string, string>();
+            RegisterDdosShutdownHandlers();
 
             this.HarmonyHandle = new HarmonyLib.Harmony(HarmonyId);
             var original = typeof(CustomBattleServer).GetMethod("OnClientWantsToConnectCustomGameMessage", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
@@ -591,6 +903,22 @@ namespace BannerlordFirewall
 
             Debug.Print("[BannerlordFirewall] Trying to add RemoveIpBehavior...", 0, Debug.DebugColor.DarkYellow);
             mission.AddMissionBehavior(new RemoveIpBehavior());
+        }
+
+        protected override void OnSubModuleUnloaded()
+        {
+            try
+            {
+                OnDdosProcessExit(null, EventArgs.Empty);
+
+                SetBlockedIPLogCallback(null);
+                StopFilter();
+            }
+            catch
+            {
+            }
+
+            base.OnSubModuleUnloaded();
         }
     }
 }
