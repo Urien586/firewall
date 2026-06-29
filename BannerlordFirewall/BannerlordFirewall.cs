@@ -5,12 +5,11 @@ using System.Collections.Concurrent;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using TaleWorlds.Library;
 using TaleWorlds.MountAndBlade;
 using TaleWorlds.MountAndBlade.Diamond;
 using TaleWorlds.PlayerServices;
-using WindowsFirewallHelper;
-using WindowsFirewallHelper.Addresses;
 
 namespace BannerlordFirewall
 {
@@ -25,15 +24,14 @@ namespace BannerlordFirewall
         private const int MaxFastDisconnectsBeforeBlock = 3;
         private const int MaxIpChangesBeforeBlock = 4;
         private const int FastDisconnectSeconds = 45;
-        private static readonly bool DisableConflictingAllowRules = true;
         private const string HarmonyId = "mentalrob.bannerlordfirewall.bannerlord";
-        private const string LocalOnlyFallbackAddress = "127.255.255.254";
+        private const string NativeFilterDllName = "windivert_game_filter.dll";
 
         public static BannerlordFirewall Instance;
 
         public static readonly object FirewallLock = new object();
 
-        public ConcurrentDictionary<PlayerId, IAddress> WhitelistedIps;
+        public ConcurrentDictionary<PlayerId, IPAddress> WhitelistedIps;
         public ConcurrentDictionary<PlayerId, DateTime> WhitelistedIpLastSeen;
         public ConcurrentDictionary<PlayerId, bool> ActivePlayers;
         public ConcurrentDictionary<PlayerId, DateTime> ActivePlayerSince;
@@ -46,111 +44,40 @@ namespace BannerlordFirewall
 
         public HarmonyLib.Harmony HarmonyHandle;
 
-        private IFirewallRule _cachedFirewallRule;
-        private IFirewallRule _cachedBlacklistFirewallRule;
+        private readonly ConcurrentDictionary<string, bool> _nativeAllowedIpAddresses = new ConcurrentDictionary<string, bool>();
+        private bool _nativeFilterAvailable;
 
-        public string GetFirewallRuleName()
+        [DllImport(NativeFilterDllName, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void AddAllowedIP(uint ip);
+
+        [DllImport(NativeFilterDllName, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void RemoveAllowedIP(uint ip);
+
+        public bool IsNativeFilterAvailable()
         {
-            int port = Module.CurrentModule.StartupInfo.ServerPort;
-            return "Bannerlord Firewall " + port.ToString();
-        }
-
-        public string GetBlacklistFirewallRuleName()
-        {
-            int port = Module.CurrentModule.StartupInfo.ServerPort;
-            return "Bannerlord Firewall Blacklist " + port.ToString();
-        }
-
-        public IFirewallRule GetFirewallRule()
-        {
-            if (this._cachedFirewallRule == null)
-            {
-                string ruleName = this.GetFirewallRuleName();
-                this._cachedFirewallRule = FirewallManager.Instance.Rules.FirstOrDefault(r => r.Name == ruleName);
-            }
-
-            return this._cachedFirewallRule;
-        }
-
-        public IFirewallRule GetBlacklistFirewallRule()
-        {
-            if (this._cachedBlacklistFirewallRule == null)
-            {
-                string ruleName = this.GetBlacklistFirewallRuleName();
-                this._cachedBlacklistFirewallRule = FirewallManager.Instance.Rules.FirstOrDefault(r => r.Name == ruleName);
-            }
-
-            return this._cachedBlacklistFirewallRule;
-        }
-
-        public void CreateFirewallRule()
-        {
-            int port = Module.CurrentModule.StartupInfo.ServerPort;
-            if (port < 1 || port > 65535)
-            {
-                throw new InvalidOperationException("[BannerlordFirewall] Invalid server port: " + port.ToString());
-            }
-
-            this._cachedFirewallRule = FirewallManager.Instance.CreatePortRule(
-                FirewallProfiles.Domain | FirewallProfiles.Private | FirewallProfiles.Public,
-                this.GetFirewallRuleName(),
-                FirewallAction.Allow,
-                Convert.ToUInt16(port),
-                FirewallProtocol.UDP
-            );
-            this._cachedFirewallRule.RemoteAddresses = BuildRemoteAddressList(this.WhitelistedIps.Values.ToArray());
-            FirewallManager.Instance.Rules.Add(this._cachedFirewallRule);
-        }
-
-        public void CreateBlacklistFirewallRule()
-        {
-            int port = Module.CurrentModule.StartupInfo.ServerPort;
-            if (port < 1 || port > 65535)
-            {
-                throw new InvalidOperationException("[BannerlordFirewall] Invalid server port: " + port.ToString());
-            }
-
-            this._cachedBlacklistFirewallRule = FirewallManager.Instance.CreatePortRule(
-                FirewallProfiles.Domain | FirewallProfiles.Private | FirewallProfiles.Public,
-                this.GetBlacklistFirewallRuleName(),
-                FirewallAction.Block,
-                Convert.ToUInt16(port),
-                FirewallProtocol.UDP
-            );
-            this._cachedBlacklistFirewallRule.RemoteAddresses = BuildRemoteAddressList(this.GetBlockedFirewallAddressesLocked());
-            FirewallManager.Instance.Rules.Add(this._cachedBlacklistFirewallRule);
+            return this._nativeFilterAvailable;
         }
 
         public bool EnsureFirewallRule()
+        {
+            return this.EnsureNativeFilter();
+        }
+
+        public bool EnsureNativeFilter()
         {
             try
             {
                 lock (FirewallLock)
                 {
-                    if (this.GetFirewallRule() == null)
-                    {
-                        Debug.Print("[BannerlordFirewall] FirewallRule " + this.GetFirewallRuleName() + " not found on your server. Creating...", 0, Debug.DebugColor.Red);
-                        this.CreateFirewallRule();
-                    }
-
-                    if (this.GetBlacklistFirewallRule() == null)
-                    {
-                        Debug.Print("[BannerlordFirewall] Blacklist FirewallRule " + this.GetBlacklistFirewallRuleName() + " not found on your server. Creating...", 0, Debug.DebugColor.Red);
-                        this.CreateBlacklistFirewallRule();
-                    }
-
-                    this.HardenFirewallRuleLocked();
-                    this.HardenBlacklistFirewallRuleLocked();
                     this.RefreshFirewallWhitelistLocked();
-                    this.HandleConflictingAllowRulesLocked();
-                    return this.GetFirewallRule() != null && this.GetBlacklistFirewallRule() != null;
+                    this._nativeFilterAvailable = true;
+                    return true;
                 }
             }
             catch (Exception exception)
             {
-                Debug.Print("[BannerlordFirewall] Firewall rule could not be created or updated: " + SafeLogValue(exception.Message), 0, Debug.DebugColor.Red);
-                this._cachedFirewallRule = null;
-                this._cachedBlacklistFirewallRule = null;
+                Debug.Print("[BannerlordFirewall] Native WinDivert filter could not be initialized: " + SafeLogValue(exception.Message), 0, Debug.DebugColor.Red);
+                this._nativeFilterAvailable = false;
                 return false;
             }
         }
@@ -163,7 +90,7 @@ namespace BannerlordFirewall
                 return false;
             }
 
-            IAddress firewallAddress;
+            IPAddress firewallAddress;
             string rejectReason;
             if (!TryCreateFirewallAddress(rawIpAddress, out firewallAddress, out rejectReason))
             {
@@ -214,7 +141,7 @@ namespace BannerlordFirewall
                 this.WhitelistedIps[playerId] = firewallAddress;
                 this.WhitelistedIpLastSeen[playerId] = DateTime.UtcNow;
                 this.ActivePlayers[playerId] = isAlreadyActive;
-                Debug.Print("[BannerlordFirewall] " + firewallAddress.ToString() + " added to pending firewall whitelist", 0, Debug.DebugColor.Green);
+                Debug.Print("[BannerlordFirewall] " + firewallAddress.ToString() + " added to pending native whitelist", 0, Debug.DebugColor.Green);
 
                 if (refreshFirewall)
                 {
@@ -244,7 +171,7 @@ namespace BannerlordFirewall
                 this.ActivePlayerSince[playerId] = DateTime.UtcNow;
                 this.WhitelistedIpLastSeen[playerId] = DateTime.UtcNow;
                 this.RefreshFirewallWhitelistLocked();
-                Debug.Print("[BannerlordFirewall] " + SafeLogValue(playerName) + " confirmed in game; firewall IP is now active.", 0, Debug.DebugColor.Green);
+                Debug.Print("[BannerlordFirewall] " + SafeLogValue(playerName) + " confirmed in game; native filter IP is now active.", 0, Debug.DebugColor.Green);
                 return true;
             }
         }
@@ -258,7 +185,7 @@ namespace BannerlordFirewall
 
             lock (FirewallLock)
             {
-                IAddress removedAddress;
+                IPAddress removedAddress;
                 if (!this.WhitelistedIps.TryRemove(playerId, out removedAddress))
                 {
                     return false;
@@ -283,12 +210,12 @@ namespace BannerlordFirewall
                 }
 
                 this.RefreshFirewallWhitelistLocked();
-                Debug.Print("[BannerlordFirewall] " + SafeLogValue(playerName) + " was removed from the firewall whitelist, whitelisted ip count: " + this.WhitelistedIps.Count.ToString(), 0, Debug.DebugColor.Red);
+                Debug.Print("[BannerlordFirewall] " + SafeLogValue(playerName) + " was removed from the native whitelist, whitelisted ip count: " + this.WhitelistedIps.Count.ToString(), 0, Debug.DebugColor.Red);
                 return true;
             }
         }
 
-        private int GetWhitelistedCountInSameSubnet24(IAddress newAddress)
+        private int GetWhitelistedCountInSameSubnet24(IPAddress newAddress)
         {
             string newSubnet;
             if (!TryGetSubnet24(newAddress, out newSubnet))
@@ -297,7 +224,7 @@ namespace BannerlordFirewall
             }
 
             int count = 0;
-            foreach (IAddress address in this.WhitelistedIps.Values)
+            foreach (IPAddress address in this.WhitelistedIps.Values)
             {
                 string subnet;
                 if (TryGetSubnet24(address, out subnet) && string.Equals(subnet, newSubnet, StringComparison.Ordinal))
@@ -309,21 +236,15 @@ namespace BannerlordFirewall
             return count;
         }
 
-        private static bool TryGetSubnet24(IAddress address, out string subnet)
+        private static bool TryGetSubnet24(IPAddress address, out string subnet)
         {
             subnet = null;
-            if (address == null)
+            if (address == null || address.AddressFamily != AddressFamily.InterNetwork)
             {
                 return false;
             }
 
-            IPAddress ipAddress;
-            if (!IPAddress.TryParse(address.ToString(), out ipAddress) || ipAddress.AddressFamily != AddressFamily.InterNetwork)
-            {
-                return false;
-            }
-
-            byte[] bytes = ipAddress.GetAddressBytes();
+            byte[] bytes = address.GetAddressBytes();
             subnet = bytes[0].ToString() + "." + bytes[1].ToString() + "." + bytes[2].ToString();
             return true;
         }
@@ -338,61 +259,18 @@ namespace BannerlordFirewall
 
         private void RefreshFirewallWhitelistLocked()
         {
-            IFirewallRule firewallRule = this.GetFirewallRule();
-            if (firewallRule == null)
-            {
-                return;
-            }
-
             try
             {
                 this.RemoveExpiredBlocksLocked();
                 this.RemoveExpiredWhitelistEntriesLocked();
-                this.HardenFirewallRuleLocked();
-                this.HardenBlacklistFirewallRuleLocked();
-                this.HandleConflictingAllowRulesLocked();
-                firewallRule.RemoteAddresses = BuildRemoteAddressList(this.WhitelistedIps.Values.ToArray());
+                this.SyncNativeWhitelistLocked();
+                this._nativeFilterAvailable = true;
             }
             catch (Exception exception)
             {
-                Debug.Print("[BannerlordFirewall] Firewall whitelist update failed: " + SafeLogValue(exception.Message), 0, Debug.DebugColor.Red);
-                this._cachedFirewallRule = null;
-                this._cachedBlacklistFirewallRule = null;
+                Debug.Print("[BannerlordFirewall] Native whitelist update failed: " + SafeLogValue(exception.Message), 0, Debug.DebugColor.Red);
+                this._nativeFilterAvailable = false;
             }
-        }
-
-        private void HardenFirewallRuleLocked()
-        {
-            IFirewallRule firewallRule = this.GetFirewallRule();
-            if (firewallRule == null)
-            {
-                return;
-            }
-
-            int port = Module.CurrentModule.StartupInfo.ServerPort;
-            firewallRule.IsEnable = true;
-            firewallRule.Action = FirewallAction.Allow;
-            firewallRule.Direction = FirewallDirection.Inbound;
-            firewallRule.Protocol = FirewallProtocol.UDP;
-            firewallRule.LocalPorts = new ushort[] { Convert.ToUInt16(port) };
-            firewallRule.RemoteAddresses = BuildRemoteAddressList(this.WhitelistedIps.Values.ToArray());
-        }
-
-        private void HardenBlacklistFirewallRuleLocked()
-        {
-            IFirewallRule firewallRule = this.GetBlacklistFirewallRule();
-            if (firewallRule == null)
-            {
-                return;
-            }
-
-            int port = Module.CurrentModule.StartupInfo.ServerPort;
-            firewallRule.IsEnable = true;
-            firewallRule.Action = FirewallAction.Block;
-            firewallRule.Direction = FirewallDirection.Inbound;
-            firewallRule.Protocol = FirewallProtocol.UDP;
-            firewallRule.LocalPorts = new ushort[] { Convert.ToUInt16(port) };
-            firewallRule.RemoteAddresses = BuildRemoteAddressList(this.GetBlockedFirewallAddressesLocked());
         }
 
         private void RemoveExpiredWhitelistEntriesLocked()
@@ -411,7 +289,7 @@ namespace BannerlordFirewall
                     continue;
                 }
 
-                IAddress removedAddress;
+                IPAddress removedAddress;
                 DateTime removedLastSeen;
                 bool removedActiveState;
                 DateTime removedActiveSince;
@@ -466,7 +344,7 @@ namespace BannerlordFirewall
                 if (string.Equals(GetPlayerKey(pair.Key), playerKey, StringComparison.Ordinal) ||
                     (!string.IsNullOrEmpty(ipAddressText) && pair.Value != null && string.Equals(pair.Value.ToString(), ipAddressText, StringComparison.Ordinal)))
                 {
-                    IAddress removedAddress;
+                    IPAddress removedAddress;
                     DateTime removedLastSeen;
                     bool removedActiveState;
                     DateTime removedActiveSince;
@@ -477,7 +355,7 @@ namespace BannerlordFirewall
                 }
             }
 
-            this.HardenBlacklistFirewallRuleLocked();
+            this.SyncNativeWhitelistLocked();
             Debug.Print("[BannerlordFirewall] TEMP BLOCK for " + TemporaryBlockMinutes.ToString() + " minutes (" + SafeLogValue(reason) + "): " + SafeLogValue(playerKey) + " / " + SafeLogValue(ipAddressText), 0, Debug.DebugColor.Red);
         }
 
@@ -502,100 +380,43 @@ namespace BannerlordFirewall
                     this.BlockedIpAddresses.TryRemove(block.Key, out removedUntil);
                 }
             }
-
-            this.HardenBlacklistFirewallRuleLocked();
         }
 
-        private IAddress[] GetBlockedFirewallAddressesLocked()
+        private void SyncNativeWhitelistLocked()
         {
-            DateTime now = DateTime.UtcNow;
-            return this.BlockedIpAddresses
-                .Where(block => block.Value > now)
-                .Select(block => CreateSingleIpOrNull(block.Key))
-                .Where(address => address != null)
-                .GroupBy(address => address.ToString(), StringComparer.OrdinalIgnoreCase)
-                .Select(group => group.First())
-                .Take(MaxWhitelistedPlayers)
-                .ToArray();
-        }
-
-        private static IAddress CreateSingleIpOrNull(string ipAddressText)
-        {
-            if (string.IsNullOrWhiteSpace(ipAddressText))
-            {
-                return null;
-            }
-
-            SingleIP address;
-            if (!SingleIP.TryParse(ipAddressText, out address))
-            {
-                return null;
-            }
-
-            return address;
-        }
-
-        private void HandleConflictingAllowRulesLocked()
-        {
-            int port = Module.CurrentModule.StartupInfo.ServerPort;
-            foreach (IFirewallRule rule in FirewallManager.Instance.Rules)
-            {
-                if (rule == null ||
-                    string.Equals(rule.Name, this.GetFirewallRuleName(), StringComparison.Ordinal) ||
-                    string.Equals(rule.Name, this.GetBlacklistFirewallRuleName(), StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                if (!rule.IsEnable || rule.Action != FirewallAction.Allow || rule.Protocol != FirewallProtocol.UDP)
-                {
-                    continue;
-                }
-
-                if (rule.LocalPorts == null || !rule.LocalPorts.Contains(Convert.ToUInt16(port)))
-                {
-                    continue;
-                }
-
-                if (rule.RemoteAddresses == null || rule.RemoteAddresses.Length == 0)
-                {
-                    if (DisableConflictingAllowRules)
-                    {
-                        rule.IsEnable = false;
-                        Debug.Print("[BannerlordFirewall] DISABLED conflicting allow-any UDP rule on port " + port.ToString() + ": " + SafeLogValue(rule.Name), 0, Debug.DebugColor.Red);
-                    }
-                    else
-                    {
-                        Debug.Print("[BannerlordFirewall] WARNING: Another enabled allow rule opens UDP port " + port.ToString() + " to everyone: " + SafeLogValue(rule.Name), 0, Debug.DebugColor.Red);
-                    }
-                }
-            }
-        }
-
-        private static IAddress[] BuildRemoteAddressList(IAddress[] allowedAddresses)
-        {
-            IAddress[] cleanAddresses = allowedAddresses
-                .Where(address => address != null)
-                .GroupBy(address => address.ToString(), StringComparer.OrdinalIgnoreCase)
-                .Select(group => group.First())
+            string[] desiredAddresses = this.WhitelistedIps.Values
+                .Where(address => address != null && address.AddressFamily == AddressFamily.InterNetwork)
+                .Select(address => address.ToString())
+                .Where(address => !this.BlockedIpAddresses.ContainsKey(address))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Take(MaxWhitelistedPlayers)
                 .ToArray();
 
-            if (cleanAddresses.Length > 0)
+            foreach (string desiredAddress in desiredAddresses)
             {
-                return cleanAddresses;
+                if (this._nativeAllowedIpAddresses.ContainsKey(desiredAddress))
+                {
+                    continue;
+                }
+
+                AddAllowedIP(ToNativeUInt32(desiredAddress));
+                this._nativeAllowedIpAddresses[desiredAddress] = true;
             }
 
-            SingleIP localOnlyAddress;
-            if (!SingleIP.TryParse(LocalOnlyFallbackAddress, out localOnlyAddress))
+            foreach (string existingAddress in this._nativeAllowedIpAddresses.Keys.ToArray())
             {
-                throw new InvalidOperationException("[BannerlordFirewall] Local fallback IP could not be parsed.");
-            }
+                if (desiredAddresses.Contains(existingAddress, StringComparer.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
 
-            return new IAddress[] { localOnlyAddress };
+                RemoveAllowedIP(ToNativeUInt32(existingAddress));
+                bool removed;
+                this._nativeAllowedIpAddresses.TryRemove(existingAddress, out removed);
+            }
         }
 
-        private static bool TryCreateFirewallAddress(string rawIpAddress, out IAddress firewallAddress, out string rejectReason)
+        private static bool TryCreateFirewallAddress(string rawIpAddress, out IPAddress firewallAddress, out string rejectReason)
         {
             firewallAddress = null;
             rejectReason = null;
@@ -624,15 +445,13 @@ namespace BannerlordFirewall
                 return false;
             }
 
-            SingleIP parsedAddress;
-            if (!SingleIP.TryParse(ipAddress.ToString(), out parsedAddress))
-            {
-                rejectReason = "firewall address parser rejected it";
-                return false;
-            }
-
-            firewallAddress = parsedAddress;
+            firewallAddress = ipAddress;
             return true;
+        }
+
+        private static uint ToNativeUInt32(string ipAddressText)
+        {
+            return BitConverter.ToUInt32(IPAddress.Parse(ipAddressText).GetAddressBytes(), 0);
         }
 
         private static bool IsPublicUnicastIpv4(IPAddress ipAddress, out string rejectReason)
@@ -729,7 +548,7 @@ namespace BannerlordFirewall
             base.OnSubModuleLoad();
             Instance = this;
 
-            this.WhitelistedIps = new ConcurrentDictionary<PlayerId, IAddress>();
+            this.WhitelistedIps = new ConcurrentDictionary<PlayerId, IPAddress>();
             this.WhitelistedIpLastSeen = new ConcurrentDictionary<PlayerId, DateTime>();
             this.ActivePlayers = new ConcurrentDictionary<PlayerId, bool>();
             this.ActivePlayerSince = new ConcurrentDictionary<PlayerId, DateTime>();
@@ -760,7 +579,7 @@ namespace BannerlordFirewall
                 }
             }
 
-            this.EnsureFirewallRule();
+            this.EnsureNativeFilter();
         }
 
         public override void OnBeforeMissionBehaviorInitialize(Mission mission)

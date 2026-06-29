@@ -9,7 +9,7 @@ namespace BannerlordFirewall.PatchedCode
         public static bool PrefixOnClientWantsToConnectCustomGameMessage(ClientWantsToConnectCustomGameMessage message)
         {
             BannerlordFirewall firewall = BannerlordFirewall.Instance;
-            if (firewall == null || firewall.GetFirewallRule() == null)
+            if (firewall == null || !firewall.IsNativeFilterAvailable())
             {
                 return true;
             }

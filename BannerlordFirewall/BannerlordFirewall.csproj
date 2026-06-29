@@ -77,9 +77,6 @@
     <Reference Include="TaleWorlds.PlayerServices, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null">
       <HintPath>..\..\GitHub\PersistentEmpires\PersistentEmpiresLib\PersistentEmpiresLib\ClientReferences\TaleWorlds.PlayerServices.dll</HintPath>
     </Reference>
-    <Reference Include="WindowsFirewallHelper, Version=2.2.0.85, Culture=neutral, PublicKeyToken=310fd07b25df79b3, processorArchitecture=MSIL">
-      <HintPath>..\packages\WindowsFirewallHelper.2.2.0.86\lib\net40\WindowsFirewallHelper.dll</HintPath>
-    </Reference>
   </ItemGroup>
   <ItemGroup>
     <Compile Include="BannerlordFirewall.cs" />
